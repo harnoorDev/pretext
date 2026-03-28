@@ -11,7 +11,7 @@ export type PreparedLineBreakData = {
   lineEndFitAdvances: number[]
   lineEndPaintAdvances: number[]
   kinds: SegmentBreakKind[]
-  simpleLineCountFastPath: boolean
+  simpleLineWalkFastPath: boolean
   breakableWidths: (number[] | null)[]
   breakablePrefixWidths: (number[] | null)[]
   discretionaryHyphenWidth: number
@@ -131,7 +131,7 @@ export function normalizeLineStart(
 }
 
 export function countPreparedLines(prepared: PreparedLineBreakData, maxWidth: number): number {
-  if (prepared.simpleLineCountFastPath) {
+  if (prepared.simpleLineWalkFastPath) {
     return countPreparedLinesSimple(prepared, maxWidth)
   }
   return walkPreparedLines(prepared, maxWidth)
@@ -201,11 +201,179 @@ function countPreparedLinesSimple(prepared: PreparedLineBreakData, maxWidth: num
   return lineCount
 }
 
+function walkPreparedLinesSimple(
+  prepared: PreparedLineBreakData,
+  maxWidth: number,
+  onLine?: (line: InternalLayoutLine) => void,
+): number {
+  const { widths, kinds, breakableWidths, breakablePrefixWidths } = prepared
+  if (widths.length === 0) return 0
+
+  const engineProfile = getEngineProfile()
+  const lineFitEpsilon = engineProfile.lineFitEpsilon
+
+  let lineCount = 0
+  let lineW = 0
+  let hasContent = false
+  let lineStartSegmentIndex = 0
+  let lineStartGraphemeIndex = 0
+  let lineEndSegmentIndex = 0
+  let lineEndGraphemeIndex = 0
+  let pendingBreakSegmentIndex = -1
+  let pendingBreakPaintWidth = 0
+
+  function clearPendingBreak(): void {
+    pendingBreakSegmentIndex = -1
+    pendingBreakPaintWidth = 0
+  }
+
+  function emitCurrentLine(
+    endSegmentIndex = lineEndSegmentIndex,
+    endGraphemeIndex = lineEndGraphemeIndex,
+    width = lineW,
+  ): void {
+    lineCount++
+    onLine?.({
+      startSegmentIndex: lineStartSegmentIndex,
+      startGraphemeIndex: lineStartGraphemeIndex,
+      endSegmentIndex,
+      endGraphemeIndex,
+      width,
+    })
+    lineW = 0
+    hasContent = false
+    clearPendingBreak()
+  }
+
+  function startLineAtSegment(segmentIndex: number, width: number): void {
+    hasContent = true
+    lineStartSegmentIndex = segmentIndex
+    lineStartGraphemeIndex = 0
+    lineEndSegmentIndex = segmentIndex + 1
+    lineEndGraphemeIndex = 0
+    lineW = width
+  }
+
+  function startLineAtGrapheme(segmentIndex: number, graphemeIndex: number, width: number): void {
+    hasContent = true
+    lineStartSegmentIndex = segmentIndex
+    lineStartGraphemeIndex = graphemeIndex
+    lineEndSegmentIndex = segmentIndex
+    lineEndGraphemeIndex = graphemeIndex + 1
+    lineW = width
+  }
+
+  function appendWholeSegment(segmentIndex: number, width: number): void {
+    if (!hasContent) {
+      startLineAtSegment(segmentIndex, width)
+      return
+    }
+    lineW += width
+    lineEndSegmentIndex = segmentIndex + 1
+    lineEndGraphemeIndex = 0
+  }
+
+  function updatePendingBreak(segmentIndex: number, segmentWidth: number): void {
+    if (!canBreakAfter(kinds[segmentIndex]!)) return
+    pendingBreakSegmentIndex = segmentIndex + 1
+    pendingBreakPaintWidth = lineW - segmentWidth
+  }
+
+  function appendBreakableSegment(segmentIndex: number): void {
+    appendBreakableSegmentFrom(segmentIndex, 0)
+  }
+
+  function appendBreakableSegmentFrom(segmentIndex: number, startGraphemeIndex: number): void {
+    const gWidths = breakableWidths[segmentIndex]!
+    const gPrefixWidths = breakablePrefixWidths[segmentIndex] ?? null
+    for (let g = startGraphemeIndex; g < gWidths.length; g++) {
+      const gw = getBreakableAdvance(
+        gWidths,
+        gPrefixWidths,
+        g,
+        engineProfile.preferPrefixWidthsForBreakableRuns,
+      )
+
+      if (!hasContent) {
+        startLineAtGrapheme(segmentIndex, g, gw)
+        continue
+      }
+
+      if (lineW + gw > maxWidth + lineFitEpsilon) {
+        emitCurrentLine()
+        startLineAtGrapheme(segmentIndex, g, gw)
+      } else {
+        lineW += gw
+        lineEndSegmentIndex = segmentIndex
+        lineEndGraphemeIndex = g + 1
+      }
+    }
+
+    if (hasContent && lineEndSegmentIndex === segmentIndex && lineEndGraphemeIndex === gWidths.length) {
+      lineEndSegmentIndex = segmentIndex + 1
+      lineEndGraphemeIndex = 0
+    }
+  }
+
+  let i = 0
+  while (i < widths.length) {
+    const w = widths[i]!
+    const kind = kinds[i]!
+
+    if (!hasContent) {
+      if (w > maxWidth && breakableWidths[i] !== null) {
+        appendBreakableSegment(i)
+      } else {
+        startLineAtSegment(i, w)
+      }
+      updatePendingBreak(i, w)
+      i++
+      continue
+    }
+
+    const newW = lineW + w
+    if (newW > maxWidth + lineFitEpsilon) {
+      if (canBreakAfter(kind)) {
+        appendWholeSegment(i, w)
+        emitCurrentLine(i + 1, 0, lineW - w)
+        i++
+        continue
+      }
+
+      if (pendingBreakSegmentIndex >= 0) {
+        emitCurrentLine(pendingBreakSegmentIndex, 0, pendingBreakPaintWidth)
+        continue
+      }
+
+      if (w > maxWidth && breakableWidths[i] !== null) {
+        emitCurrentLine()
+        appendBreakableSegment(i)
+        i++
+        continue
+      }
+
+      emitCurrentLine()
+      continue
+    }
+
+    appendWholeSegment(i, w)
+    updatePendingBreak(i, w)
+    i++
+  }
+
+  if (hasContent) emitCurrentLine()
+  return lineCount
+}
+
 export function walkPreparedLines(
   prepared: PreparedLineBreakData,
   maxWidth: number,
   onLine?: (line: InternalLayoutLine) => void,
 ): number {
+  if (prepared.simpleLineWalkFastPath) {
+    return walkPreparedLinesSimple(prepared, maxWidth, onLine)
+  }
+
   const {
     widths,
     lineEndFitAdvances,
@@ -494,6 +662,10 @@ export function layoutNextLineRange(
   const normalizedStart = normalizeLineStart(prepared, start)
   if (normalizedStart === null) return null
 
+  if (prepared.simpleLineWalkFastPath) {
+    return layoutNextLineRangeSimple(prepared, normalizedStart, maxWidth)
+  }
+
   const chunkIndex = findChunkIndexForStart(prepared, normalizedStart.segmentIndex)
   if (chunkIndex < 0) return null
 
@@ -738,4 +910,147 @@ export function layoutNextLineRange(
   }
 
   return finishLine(chunk.consumedEndSegmentIndex, 0, lineW)
+}
+
+function layoutNextLineRangeSimple(
+  prepared: PreparedLineBreakData,
+  normalizedStart: LineBreakCursor,
+  maxWidth: number,
+): InternalLayoutLine | null {
+  const { widths, kinds, breakableWidths, breakablePrefixWidths } = prepared
+  const engineProfile = getEngineProfile()
+  const lineFitEpsilon = engineProfile.lineFitEpsilon
+
+  let lineW = 0
+  let hasContent = false
+  const lineStartSegmentIndex = normalizedStart.segmentIndex
+  const lineStartGraphemeIndex = normalizedStart.graphemeIndex
+  let lineEndSegmentIndex = lineStartSegmentIndex
+  let lineEndGraphemeIndex = lineStartGraphemeIndex
+  let pendingBreakSegmentIndex = -1
+  let pendingBreakPaintWidth = 0
+
+  function finishLine(
+    endSegmentIndex = lineEndSegmentIndex,
+    endGraphemeIndex = lineEndGraphemeIndex,
+    width = lineW,
+  ): InternalLayoutLine | null {
+    if (!hasContent) return null
+
+    return {
+      startSegmentIndex: lineStartSegmentIndex,
+      startGraphemeIndex: lineStartGraphemeIndex,
+      endSegmentIndex,
+      endGraphemeIndex,
+      width,
+    }
+  }
+
+  function startLineAtSegment(segmentIndex: number, width: number): void {
+    hasContent = true
+    lineEndSegmentIndex = segmentIndex + 1
+    lineEndGraphemeIndex = 0
+    lineW = width
+  }
+
+  function startLineAtGrapheme(segmentIndex: number, graphemeIndex: number, width: number): void {
+    hasContent = true
+    lineEndSegmentIndex = segmentIndex
+    lineEndGraphemeIndex = graphemeIndex + 1
+    lineW = width
+  }
+
+  function appendWholeSegment(segmentIndex: number, width: number): void {
+    if (!hasContent) {
+      startLineAtSegment(segmentIndex, width)
+      return
+    }
+    lineW += width
+    lineEndSegmentIndex = segmentIndex + 1
+    lineEndGraphemeIndex = 0
+  }
+
+  function updatePendingBreak(segmentIndex: number, segmentWidth: number): void {
+    if (!canBreakAfter(kinds[segmentIndex]!)) return
+    pendingBreakSegmentIndex = segmentIndex + 1
+    pendingBreakPaintWidth = lineW - segmentWidth
+  }
+
+  function appendBreakableSegmentFrom(segmentIndex: number, startGraphemeIndex: number): InternalLayoutLine | null {
+    const gWidths = breakableWidths[segmentIndex]!
+    const gPrefixWidths = breakablePrefixWidths[segmentIndex] ?? null
+    for (let g = startGraphemeIndex; g < gWidths.length; g++) {
+      const gw = getBreakableAdvance(
+        gWidths,
+        gPrefixWidths,
+        g,
+        engineProfile.preferPrefixWidthsForBreakableRuns,
+      )
+
+      if (!hasContent) {
+        startLineAtGrapheme(segmentIndex, g, gw)
+        continue
+      }
+
+      if (lineW + gw > maxWidth + lineFitEpsilon) {
+        return finishLine()
+      }
+
+      lineW += gw
+      lineEndSegmentIndex = segmentIndex
+      lineEndGraphemeIndex = g + 1
+    }
+
+    if (hasContent && lineEndSegmentIndex === segmentIndex && lineEndGraphemeIndex === gWidths.length) {
+      lineEndSegmentIndex = segmentIndex + 1
+      lineEndGraphemeIndex = 0
+    }
+    return null
+  }
+
+  for (let i = normalizedStart.segmentIndex; i < widths.length; i++) {
+    const w = widths[i]!
+    const kind = kinds[i]!
+    const startGraphemeIndex = i === normalizedStart.segmentIndex ? normalizedStart.graphemeIndex : 0
+
+    if (!hasContent) {
+      if (startGraphemeIndex > 0) {
+        const line = appendBreakableSegmentFrom(i, startGraphemeIndex)
+        if (line !== null) return line
+      } else if (w > maxWidth && breakableWidths[i] !== null) {
+        const line = appendBreakableSegmentFrom(i, 0)
+        if (line !== null) return line
+      } else {
+        startLineAtSegment(i, w)
+      }
+      updatePendingBreak(i, w)
+      continue
+    }
+
+    const newW = lineW + w
+    if (newW > maxWidth + lineFitEpsilon) {
+      if (canBreakAfter(kind)) {
+        appendWholeSegment(i, w)
+        return finishLine(i + 1, 0, lineW - w)
+      }
+
+      if (pendingBreakSegmentIndex >= 0) {
+        return finishLine(pendingBreakSegmentIndex, 0, pendingBreakPaintWidth)
+      }
+
+      if (w > maxWidth && breakableWidths[i] !== null) {
+        const currentLine = finishLine()
+        if (currentLine !== null) return currentLine
+        const line = appendBreakableSegmentFrom(i, 0)
+        if (line !== null) return line
+      }
+
+      return finishLine()
+    }
+
+    appendWholeSegment(i, w)
+    updatePendingBreak(i, w)
+  }
+
+  return finishLine()
 }
